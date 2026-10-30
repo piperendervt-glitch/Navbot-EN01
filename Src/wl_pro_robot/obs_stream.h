@@ -64,7 +64,8 @@ inline void obs_stream_loop() {
   if (n <= 0 || n >= 320) return;
 
   unsigned long t0 = micros();
-  websocket.broadcastTXT((uint8_t*)p, (size_t)n, true);
+  // headerToPayload = true のときは、ヘッダ用の空きを含む先頭（obs_buf）を渡し、長さは本文だけ
+  websocket.broadcastTXT((uint8_t*)obs_buf, (size_t)n, true);
   obs_last_send_us = micros() - t0;
   if (obs_last_send_us > OBS_SLOW_US) {
     obs_pause_until_ms = now + OBS_PAUSE_MS;
