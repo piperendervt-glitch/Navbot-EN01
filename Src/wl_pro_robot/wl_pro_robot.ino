@@ -594,8 +594,9 @@ void webSocketEventCallback(uint8_t num, WStype_t type, uint8_t* payload, size_t
     StaticJsonDocument<300> doc;
     DeserializationError error = deserializeJson(doc, payload_str);
 
-    if (doc["type"] == "obs_ctl") {  // navbot-agent: 送信の ON/OFF（{"type":"obs_ctl","on":0/1}）
-      obs_ctl((int)doc["on"] != 0);
+    if (doc["type"] == "obs_ctl") {  // navbot-agent: 送信の ON/OFF（{"type":"obs_ctl","on":0/1}）と零点の戻し（"zero_reset":1）
+      if (doc.containsKey("on")) obs_ctl((int)doc["on"] != 0);
+      if ((int)doc["zero_reset"] == 1) obs_zero_reset();
       return;
     }
     String mode_str = doc["mode"];

@@ -39,6 +39,15 @@ inline void obs_ctl(bool on) {
   obs_enabled = on;
 }
 
+// 零点を起動時の値に戻す（{"type":"obs_ctl","zero_reset":1}）。電源の入れ直しと同じ効果を Wi-Fi から起こすためのもの。
+// 公式ファームの零点は立っている間に重心に合わせて動き（4 → 7〜10 度）、座ったあとも残る。残った零点で座り姿勢から
+// 「立て」を送ると起き上がりが荒れて転ぶ（2026-10-31 の記録 on_2・on_6・off_2）。制御則そのものは変えないが、
+// 「ファームの差分は観測を送るだけ」の決まりからの小さな例外（robosheep の判断、FIRMWARE_DIFF §3c）。
+#define OBS_ZERO_DEFAULT 4.02f  // wl_pro_robot.ino の angle_zeropoint の初期値と同じ
+inline void obs_zero_reset() {
+  angle_zeropoint = OBS_ZERO_DEFAULT;
+}
+
 // loop() の末尾で毎回呼ぶ。20 ms たっていなければすぐ返る。
 inline void obs_stream_loop() {
   unsigned long now = millis();
