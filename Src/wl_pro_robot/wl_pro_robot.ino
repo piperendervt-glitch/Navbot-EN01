@@ -21,6 +21,7 @@
 #include "web_socket_client_util.h"
  
 #include "cpu0_task.h"
+#include "obs_stream.h"  // navbot-agent: 観測の口（20 ms ごとの送信）
 
 /************Instance definition*************/
 
@@ -358,6 +359,8 @@ void loop() {
   motor2.move();
 
   command.run();
+
+  obs_stream_loop();  // navbot-agent: この輪の観測を 20 ms ごとに送る（接続がある時だけ）
 }
 
 //lqr self-balancing control
@@ -591,6 +594,10 @@ void webSocketEventCallback(uint8_t num, WStype_t type, uint8_t* payload, size_t
     StaticJsonDocument<300> doc;
     DeserializationError error = deserializeJson(doc, payload_str);
 
+    if (doc["type"] == "obs_ctl") {  // navbot-agent: 送信の ON/OFF（{"type":"obs_ctl","on":0/1}）
+      obs_ctl((int)doc["on"] != 0);
+      return;
+    }
     String mode_str = doc["mode"];
     if (mode_str == "basic") {
       rp.parseBasic(doc);
