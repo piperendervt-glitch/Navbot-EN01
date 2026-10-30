@@ -48,6 +48,15 @@ inline void obs_zero_reset() {
   angle_zeropoint = OBS_ZERO_DEFAULT;
 }
 
+// 再起動（{"type":"obs_ctl","reboot":1}）。電源の入れ直しと同じで、距離の零点・積分・フィルタ・脚の状態まで起動直後に戻る。
+// 零点を戻すだけでは立ち上がりの転倒が残ったため（2026-10-31 off_3）。制御には触らない。Wi-Fi は切れるので PC 側がつなぎ直す。
+inline void obs_reboot() {
+  motor1.target = 0;
+  motor2.target = 0;
+  delay(50);
+  ESP.restart();
+}
+
 // loop() の末尾で毎回呼ぶ。20 ms たっていなければすぐ返る。
 inline void obs_stream_loop() {
   unsigned long now = millis();
