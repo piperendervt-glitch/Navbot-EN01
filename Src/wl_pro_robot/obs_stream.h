@@ -15,8 +15,8 @@
 
 #define OBS_PERIOD_MS 20        // 送信の周期（50 Hz）
 #define OBS_OFF_PERIOD_MS 1000  // 送信 OFF のときの周期（1 Hz）
-#define OBS_SLOW_US 3000        // 1 回の送信がこれより長くかかったら
-#define OBS_PAUSE_MS 1000       // この時間だけ送信を止める（TCP が詰まった時に制御の輪を守る）
+#define OBS_SLOW_US 10000       // 1 回の送信がこれより長くかかったら（実機で 3〜7 ms の揺れが 2 秒おきに出たので 3 ms → 10 ms）
+#define OBS_PAUSE_MS 200        // この時間だけ送信を止める（TCP が詰まった時に制御の輪を守る。1 s だと転倒の瞬間が消えるので 200 ms）
 
 extern WebSocketsServer websocket;
 extern MPU6050 mpu6050;
