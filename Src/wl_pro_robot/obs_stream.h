@@ -4,7 +4,11 @@
 //
 // 送る 1 通（欄の名前・単位・順は PC 側 yose/record.py の ROBOT_FIELDS と同じ）：
 // {"type":"obs","t_ms":…,"pitch":…,"pitch_rate":…,"roll":…,"yaw":…,"yaw_rate":…,"wheel_l":…,"wheel_r":…,
-//  "height_cmd":…,"height_meas":-1,"battery_v":…,"go":…,"fall":…,"u":…,"pitch_zero":…,"send_us":…}
+//  "height_cmd":…,"height_meas":-1,"battery_v":…,"go":…,"fall":…,"u":…,"pitch_zero":…,"send_us":…,
+//  "loops":…,"loop_max_us":…}
+// loops＝前の 1 通から今までに loop() が回った回数、loop_max_us＝その間でいちばん長かった 1 回の時間（µs）。
+// ファームの制御の輪が 1 秒に何回回っているかを測るためだけの欄（2026-10-31 robosheep の了承、FIRMWARE_DIFF §3e）。
+// 制御には触らない。PC 側は記録の 21 欄を変えず、thinking の層として残す。
 //
 // PC から {"type":"obs_ctl","on":0} を受けると 1 秒に 1 行だけ送る（送信 OFF の比べ用）。"on":1 で戻す。
 #include <Arduino.h>
@@ -33,7 +37,10 @@ static bool obs_enabled = true;
 static unsigned long obs_next_ms = 0;
 static unsigned long obs_pause_until_ms = 0;
 static unsigned long obs_last_send_us = 0;
-static char obs_buf[WEBSOCKETS_MAX_HEADER_SIZE + 320];  // 先頭にヘッダ分の空きを置き、TCP の書き込みを 1 回にする
+static unsigned long obs_loops = 0;          // 前の 1 通からの loop() の回数
+static unsigned long obs_loop_max_us = 0;    // その間の 1 回の最長
+static unsigned long obs_loop_last_us = 0;   // 前の loop() の時刻
+static char obs_buf[WEBSOCKETS_MAX_HEADER_SIZE + 400];  // 先頭にヘッダ分の空きを置き、TCP の書き込みを 1 回にする
 
 inline void obs_ctl(bool on) {
   obs_enabled = on;
@@ -59,6 +66,13 @@ inline void obs_reboot() {
 
 // loop() の末尾で毎回呼ぶ。20 ms たっていなければすぐ返る。
 inline void obs_stream_loop() {
+  unsigned long now_us = micros();
+  if (obs_loop_last_us != 0) {
+    unsigned long dt = now_us - obs_loop_last_us;
+    if (dt > obs_loop_max_us) obs_loop_max_us = dt;
+  }
+  obs_loop_last_us = now_us;
+  obs_loops++;
   unsigned long now = millis();
   if ((long)(now - obs_next_ms) < 0) return;
   unsigned long period = obs_enabled ? OBS_PERIOD_MS : OBS_OFF_PERIOD_MS;
@@ -68,18 +82,22 @@ inline void obs_stream_loop() {
   if ((long)(now - obs_pause_until_ms) < 0) return;                // 詰まった直後は休む
 
   char* p = obs_buf + WEBSOCKETS_MAX_HEADER_SIZE;
-  int n = snprintf(p, 320,
+  int n = snprintf(p, 400,
                    "{\"type\":\"obs\",\"t_ms\":%lu,\"pitch\":%.2f,\"pitch_rate\":%.2f,\"roll\":%.2f,"
                    "\"yaw\":%.2f,\"yaw_rate\":%.2f,\"wheel_l\":%.3f,\"wheel_r\":%.3f,"
                    "\"height_cmd\":%d,\"height_meas\":-1,\"battery_v\":%.2f,\"go\":%d,"
-                   "\"fall\":%d,\"u\":%.3f,\"pitch_zero\":%.2f,\"send_us\":%lu}",
+                   "\"fall\":%d,\"u\":%.3f,\"pitch_zero\":%.2f,\"send_us\":%lu,"
+                   "\"loops\":%lu,\"loop_max_us\":%lu}",
                    now, LQR_angle, LQR_gyro, (float)mpu6050.getAngleX(),
                    YAW_angle, YAW_gyro,
                    motor1.shaft_velocity * (2.0f * rp.m1_direction),   // 向きは ±0.5 なので ±1 に戻す
                    motor2.shaft_velocity * (2.0f * rp.m2_direction),
                    (int)wrobot.height, (float)rp.battery_voltage, wrobot.go ? 1 : 0,
-                   rp.uncontrollable != 0 ? 1 : 0, LQR_u, angle_zeropoint, obs_last_send_us);
-  if (n <= 0 || n >= 320) return;
+                   rp.uncontrollable != 0 ? 1 : 0, LQR_u, angle_zeropoint, obs_last_send_us,
+                   obs_loops, obs_loop_max_us);
+  if (n <= 0 || n >= 400) return;  // 欄を足したので 320 → 400（いちばん長い値でも 348 文字）
+  obs_loops = 0;
+  obs_loop_max_us = 0;
 
   unsigned long t0 = micros();
   // headerToPayload = true のときは、ヘッダ用の空きを含む先頭（obs_buf）を渡し、長さは本文だけ
