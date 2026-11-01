@@ -5,10 +5,14 @@
 // 送る 1 通（欄の名前・単位・順は PC 側 yose/record.py の ROBOT_FIELDS と同じ）：
 // {"type":"obs","t_ms":…,"pitch":…,"pitch_rate":…,"roll":…,"yaw":…,"yaw_rate":…,"wheel_l":…,"wheel_r":…,
 //  "height_cmd":…,"height_meas":-1,"battery_v":…,"go":…,"fall":…,"u":…,"pitch_zero":…,"send_us":…,
-//  "loops":…,"loop_max_us":…}
+//  "loops":…,"loop_max_us":…,"leg_pos_l":…,"leg_pos_r":…,"leg_us":…}
 // loops＝前の 1 通から今までに loop() が回った回数、loop_max_us＝その間でいちばん長かった 1 回の時間（µs）。
 // ファームの制御の輪が 1 秒に何回回っているかを測るためだけの欄（2026-10-31 robosheep の了承、FIRMWARE_DIFF §3e）。
 // 制御には触らない。PC 側は記録の 21 欄を変えず、thinking の層として残す。
+//
+// leg_pos_l・leg_pos_r＝左右の脚のサーボ STS3032（ID 1＝左、ID 2＝右）の今の位置（0〜4095、読めなければ -1）。
+// leg_us＝その 2 個を読むのにかかった時間（µs）。送る直前に 1 回だけ読む（20 ms に 1 回）。
+// 読むだけで、サーボへの指令（leg_loop）は変えない（2026-11-01 robosheep の了承、navbot-agent-record/2）。
 //
 // PC から {"type":"obs_ctl","on":0} を受けると 1 秒に 1 行だけ送る（送信 OFF の比べ用）。"on":1 で戻す。
 #include <Arduino.h>
@@ -16,6 +20,7 @@
 #include <SimpleFOC.h>
 #include <MPU6050_tockn.h>
 #include "robot.h"
+#include "Servo_STS3032.h"
 
 #define OBS_PERIOD_MS 20        // 送信の周期（50 Hz）
 #define OBS_OFF_PERIOD_MS 1000  // 送信 OFF のときの周期（1 Hz）
@@ -40,7 +45,8 @@ static unsigned long obs_last_send_us = 0;
 static unsigned long obs_loops = 0;          // 前の 1 通からの loop() の回数
 static unsigned long obs_loop_max_us = 0;    // その間の 1 回の最長
 static unsigned long obs_loop_last_us = 0;   // 前の loop() の時刻
-static char obs_buf[WEBSOCKETS_MAX_HEADER_SIZE + 400];  // 先頭にヘッダ分の空きを置き、TCP の書き込みを 1 回にする
+#define OBS_TEXT_MAX 480    // 1 通の本文の上限（脚の 3 欄を足したので 400 → 480）
+static char obs_buf[WEBSOCKETS_MAX_HEADER_SIZE + OBS_TEXT_MAX];  // 先頭にヘッダ分の空きを置き、TCP の書き込みを 1 回にする
 
 inline void obs_ctl(bool on) {
   obs_enabled = on;
@@ -64,6 +70,70 @@ inline void obs_reboot() {
   ESP.restart();
 }
 
+// ---- 脚のサーボの今の位置を読む ----
+// 公式の Servo_STS3032 には書く関数しか無いので、SMS_STS の「読む」命令（0x02、番地 56＝今の位置、2 バイト）を
+// ここで 1 回分だけ組む。同じ線（Serial2、1 Mbps）を leg_loop も使うが、どちらも loop() の中なので重ならない。
+// 1 回は 8 バイト送って 8 バイト返るだけ（1 Mbps で各 80 µs ほど）。返事が無ければ OBS_LEG_TIMEOUT_US で諦める。
+// 続けて読めないサーボは、1 秒に 1 回だけ試す（線が無い・電源が無い時に、毎回待って輪を遅くしないため）。
+#define OBS_LEG_ADDR 56            // SMS_STS の今の位置の番地
+#define OBS_LEG_TIMEOUT_US 1000    // 1 個の返事を待つ最長
+#define OBS_LEG_FAIL_MAX 5         // これだけ続けて読めなければ、間を空ける
+#define OBS_LEG_RETRY_MS 1000      // 間を空けたときの試す間隔
+static int obs_leg_pos[2] = { -1, -1 };
+static unsigned long obs_leg_us = 0;
+static uint8_t obs_leg_fail[2] = { 0, 0 };
+static unsigned long obs_leg_retry_ms[2] = { 0, 0 };
+
+static int obs_read_leg_once(uint8_t id) {
+  HardwareSerial* s = sms_sts.pSerial;
+  if (s == NULL) return -1;
+  uint8_t req[8] = { 0xFF, 0xFF, id, 4, 0x02, OBS_LEG_ADDR, 2, 0 };
+  req[7] = ~(uint8_t)(id + 4 + 0x02 + OBS_LEG_ADDR + 2);
+  while (s->read() != -1) {}  // 前の残りを捨てる
+  s->write(req, 8);
+  uint8_t b[8];
+  int k = 0;
+  unsigned long t0 = micros();
+  while ((unsigned long)(micros() - t0) < OBS_LEG_TIMEOUT_US) {
+    int c = s->read();
+    if (c < 0) continue;
+    if (k < 2) {  // 頭の FF FF を探す
+      if (c == 0xFF) b[k++] = 0xFF; else k = 0;
+      continue;
+    }
+    if (k == 2 && c == 0xFF) continue;  // FF が 3 つ以上続いた
+    b[k++] = (uint8_t)c;
+    if (k < 8) continue;
+    k = 0;
+    if (memcmp(b, req, 8) == 0) continue;  // 線の作りによっては自分の送った命令がそのまま返るので飛ばす
+    uint8_t sum = ~(uint8_t)(b[2] + b[3] + b[4] + b[5] + b[6]);
+    if (b[2] != id || b[3] != 4 || b[7] != sum) continue;
+    int pos = (int)b[5] | ((int)b[6] << 8);  // 下位が先（SMS_STS）
+    if (pos & 0x8000) pos = -(pos & 0x7FFF);  // 15 ビット目は向きの印
+    return pos;
+  }
+  return -1;
+}
+
+static void obs_read_legs(unsigned long now_ms) {
+  unsigned long t0 = micros();
+  for (int i = 0; i < 2; i++) {
+    if (obs_leg_fail[i] >= OBS_LEG_FAIL_MAX && (long)(now_ms - obs_leg_retry_ms[i]) < 0) {
+      obs_leg_pos[i] = -1;
+      continue;
+    }
+    int v = obs_read_leg_once((uint8_t)(i + 1));  // ID 1＝左、ID 2＝右（setup の並び）
+    obs_leg_pos[i] = v;
+    if (v < 0) {
+      if (obs_leg_fail[i] < 255) obs_leg_fail[i]++;
+      obs_leg_retry_ms[i] = now_ms + OBS_LEG_RETRY_MS;
+    } else {
+      obs_leg_fail[i] = 0;
+    }
+  }
+  obs_leg_us = micros() - t0;
+}
+
 // loop() の末尾で毎回呼ぶ。20 ms たっていなければすぐ返る。
 inline void obs_stream_loop() {
   unsigned long now_us = micros();
@@ -81,21 +151,25 @@ inline void obs_stream_loop() {
   if (websocket.connectedClients() == 0) return;                   // 接続が無ければ何もしない
   if ((long)(now - obs_pause_until_ms) < 0) return;                // 詰まった直後は休む
 
+  obs_read_legs(now);  // 送る直前に脚の位置を読む（20 ms に 1 回）
+
   char* p = obs_buf + WEBSOCKETS_MAX_HEADER_SIZE;
-  int n = snprintf(p, 400,
+  int n = snprintf(p, OBS_TEXT_MAX,
                    "{\"type\":\"obs\",\"t_ms\":%lu,\"pitch\":%.2f,\"pitch_rate\":%.2f,\"roll\":%.2f,"
                    "\"yaw\":%.2f,\"yaw_rate\":%.2f,\"wheel_l\":%.3f,\"wheel_r\":%.3f,"
                    "\"height_cmd\":%d,\"height_meas\":-1,\"battery_v\":%.2f,\"go\":%d,"
                    "\"fall\":%d,\"u\":%.3f,\"pitch_zero\":%.2f,\"send_us\":%lu,"
-                   "\"loops\":%lu,\"loop_max_us\":%lu}",
+                   "\"loops\":%lu,\"loop_max_us\":%lu,"
+                   "\"leg_pos_l\":%d,\"leg_pos_r\":%d,\"leg_us\":%lu}",
                    now, LQR_angle, LQR_gyro, (float)mpu6050.getAngleX(),
                    YAW_angle, YAW_gyro,
                    motor1.shaft_velocity * (2.0f * rp.m1_direction),   // 向きは ±0.5 なので ±1 に戻す
                    motor2.shaft_velocity * (2.0f * rp.m2_direction),
                    (int)wrobot.height, (float)rp.battery_voltage, wrobot.go ? 1 : 0,
                    rp.uncontrollable != 0 ? 1 : 0, LQR_u, angle_zeropoint, obs_last_send_us,
-                   obs_loops, obs_loop_max_us);
-  if (n <= 0 || n >= 400) return;  // 欄を足したので 320 → 400（いちばん長い値でも 348 文字）
+                   obs_loops, obs_loop_max_us,
+                   obs_leg_pos[0], obs_leg_pos[1], obs_leg_us);
+  if (n <= 0 || n >= OBS_TEXT_MAX) return;  // 脚の 3 欄で 400 → 480（いちばん長い値でも 400 文字ほど）
   obs_loops = 0;
   obs_loop_max_us = 0;
 
